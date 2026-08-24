@@ -1,0 +1,37 @@
+# SlopOn-agent job: two concurrent hello-world trials driven by the
+# SlopOn backend's agentic loop.
+#
+# Run from the harbor repository root (the task path is local):
+#   SLOPON_LLM_API_KEY=<key> harbor job start -c /path/to/harbor-adaptor/examples/hello-world-slopon.yaml
+# Sanity-check the resolved config first:
+#   harbor job start -c examples/hello-world-slopon.yaml --print-config
+#
+# SLOPON_LLM_API_KEY comes from the harbor PROCESS environment — never from
+# agent env (--ae / env: below): harbor injects agent env into every
+# container exec, which would leak the key into the task container. The
+# backend API key is read from ~/.slopon/config.json on the host.
+
+n_concurrent_trials: 2
+
+tasks:
+  - path: examples/tasks/hello-world
+
+agents:
+  - name: slopon_harbor.agent:SlopOnAgent
+    model_name: <model_id>          # e.g. the provider's model id
+    override_setup_timeout_sec: 600 # Node install + runtime upload + online wait
+    override_timeout_sec: 900
+    env:
+      SLOPON_RUNNER_RUNTIME: /abs/path/slopon-runtime
+      SLOPON_LLM_BASE_URL: https://llm-provider.example.com/v1
+    # hello-world defaults to 'public' networking, where these lists are
+    # inert. For 'allowlist' tasks, the backend address must appear in BOTH
+    # lists (the runner connects during setup() as well as during run()),
+    # and the LLM provider host in the agent list.
+    extra_allowed_hosts:
+      - "172.16.0.0/12"
+      - llm-provider.example.com
+
+environment:
+  extra_allowed_hosts:
+    - "172.16.0.0/12"
