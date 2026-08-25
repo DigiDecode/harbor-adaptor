@@ -48,23 +48,25 @@ credentials means starting from a fresh `~/.slopon` (fresh DB).
 
 ## 2. Prepare the runner runtime (once per benchmark host)
 
-1. Download the combined customer bundle published under the literal
-   `latest` tag (assets are overwritten in place on every release, so
-   **record the asset's SHA-256 from the release-notes table** to make
-   the benchmarked backend version traceable):
+1. Download the combined customer bundle published as versioned GitHub
+   releases (`vX.Y.Z`) marked Latest. The stable
+   `releases/latest/download/...` URL always serves the newest build —
+   follow redirects with `curl -L` / `wget`. **Record the asset's SHA-256
+   from the release-notes table** so the benchmarked backend version is
+   traceable:
 
    ```
-   https://github.com/DigiDecode/SlopOn.dev/releases/download/latest/slopon-latest-linux-x64.zip
+   https://github.com/DigiDecode/SlopOn.dev/releases/latest/download/slopon-linux-x64.tar.gz
    ```
 
-2. Unzip. The layout is `slopon-latest-linux-x64/{README.md, frontend/,
-   backend/}` — only `backend/` matters (the `frontend/` Flutter desktop
-   app is irrelevant to benchmarks). The `backend/` subtree ships
+2. Extract with `tar -xzf`. The layout is `slopon-linux-x64/{README.md,
+   frontend/, backend/}` — only `backend/` matters (the `frontend/` Flutter
+   desktop app is irrelevant to benchmarks). The `backend/` subtree ships
    `index.js`, `runner.js`, `package.json`, `pnpm-workspace.yaml`,
    `README.md`, `migrations/`, `prompts/` — and **no `node_modules`**.
 
 3. Run `npm install` inside
-   `<unzip-dir>/slopon-latest-linux-x64/backend` (requires Node ≥ 20,
+   `<extract-dir>/slopon-linux-x64/backend` (requires Node ≥ 20,
    git, and a C toolchain on the host — `better-sqlite3` has a native
    build). npm produces the flat `node_modules/` layout the runner
    needs.
