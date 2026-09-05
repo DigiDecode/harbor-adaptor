@@ -7,8 +7,11 @@ Mirrors the wire behavior of the reference client in
 - client sends ``{type: 'auth', apiKey}`` immediately after connect;
 - requests carry string ids; responses/errors correlate by id;
 - ``chunk`` messages belong to the request id of a streaming call;
-- server-initiated ``request`` messages are answered with an empty
-  response ``{}`` (the backend treats that as "no client handler");
+- server-initiated ``request`` messages (pushes) are forwarded to the
+  optional ``on_push`` callback — invoked synchronously on the reader
+  loop, so it must be fast/non-blocking (record-and-log only) — and
+  answered with an empty response ``{}`` (the backend treats that as
+  "handled");
 - unsolicited ``event`` pushes are logged and dropped.
 
 Auth failure is detected explicitly: the backend replies
@@ -36,6 +39,7 @@ import websockets
 _MAX_FRAME_BYTES = 100 * 1024 * 1024
 
 ChunkCallback = Callable[[Any], None]
+PushCallback = Callable[[str, dict[str, Any]], None]
 
 
 class BackendClientError(Exception):
@@ -91,11 +95,15 @@ class SlopOnBackendClient:
         *,
         logger: logging.Logger,
         auth_settle_sec: float = 0.5,
+        on_push: PushCallback | None = None,
     ):
         self._url = url
         self._api_key = api_key
         self._logger = logger
         self._auth_settle_sec = auth_settle_sec
+        # Invoked synchronously on the reader loop for every server-initiated
+        # request; must be fast/non-blocking (same contract as on_chunk).
+        self._on_push = on_push
         self._ws: websockets.ClientConnection | None = None
         self._next_id = itertools.count(1)
         self._pending: dict[str, _Pending] = {}
@@ -319,12 +327,19 @@ class SlopOnBackendClient:
             return
         if mtype == "request":
             # Server-initiated push (e.g. tool approval requests to the
-            # desktop client). A headless benchmark client has no handlers;
-            # answer with an empty response exactly as the reference client
-            # does for unknown methods.
+            # desktop client, compaction lifecycle notifications to this
+            # adaptor). Forward to the registered handler, then answer with
+            # an empty response exactly as the reference client does for
+            # unknown methods (the backend treats that as "handled").
+            method = msg.get("method")
+            if self._on_push is not None and method is not None:
+                try:
+                    self._on_push(method, msg.get("params") or {})
+                except Exception:  # noqa: BLE001 - push sink must not kill reader
+                    self._logger.exception("on_push callback raised")
             self._logger.debug(
                 "backend pushed request %s; replying with empty response",
-                msg.get("method"),
+                method,
             )
             reply = json.dumps({"type": "response", "id": msg.get("id"), "data": {}})
             task = asyncio.get_running_loop().create_task(self._ws.send(reply))

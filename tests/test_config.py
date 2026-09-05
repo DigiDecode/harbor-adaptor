@@ -22,12 +22,16 @@ def config_home(tmp_path, monkeypatch):
     slopon_dir = tmp_path / ".slopon"
     slopon_dir.mkdir()
     config_path = slopon_dir / "config.json"
-    monkeypatch.setenv("HOME", str(tmp_path))
+    home = str(tmp_path)
+    monkeypatch.setenv("HOME", home)
+    # expanduser() prefers USERPROFILE on Windows.
+    monkeypatch.setenv("USERPROFILE", home)
     for var in (
         "SLOPON_BACKEND_URL",
         "SLOPON_BACKEND_API_KEY",
         "SLOPON_BACKEND_PUBLIC_URL",
         "SLOPON_LLM_API_KEY",
+        "SLOPON_LLM_CONTEXT_SIZE",
         "SLOPON_RUNNER_ONLINE_TIMEOUT_SEC",
     ):
         monkeypatch.delenv(var, raising=False)
@@ -68,6 +72,7 @@ def base_env(runtime: Path, **overrides) -> dict[str, str]:
         "SLOPON_RUNNER_RUNTIME": str(runtime),
         "SLOPON_LLM_BASE_URL": "https://llm.example.com/v1",
         "SLOPON_LLM_MODEL_ID": "test-model",
+        "SLOPON_LLM_CONTEXT_SIZE": "128000",
     }
     env.update(overrides)
     return env
@@ -190,6 +195,7 @@ class TestRequiredAndDefaults:
         cfg = AdaptorConfig.from_env(base_env(runtime_dir))
         assert cfg.container_workdir == "/app"
         assert cfg.llm_type == "openai_compatible"
+        assert cfg.llm_context_size == 128000
         assert cfg.runner_online_timeout_sec == 90.0
         assert cfg.node_version == f"v{DEFAULT_NODE_VERSION}"
         assert cfg.backend_public_url is None
@@ -201,6 +207,51 @@ class TestRequiredAndDefaults:
         env = base_env(runtime_dir, SLOPON_NODE_VERSION="24.1.0")
         with pytest.raises(AdaptorConfigError, match="v22"):
             AdaptorConfig.from_env(env)
+
+
+class TestContextSize:
+    def test_missing_context_size(self, config_home, runtime_dir, proc_llm_key):
+        valid_config(config_home)
+        env = base_env(runtime_dir)
+        del env["SLOPON_LLM_CONTEXT_SIZE"]
+        with pytest.raises(AdaptorConfigError, match="SLOPON_LLM_CONTEXT_SIZE"):
+            AdaptorConfig.from_env(env)
+
+    def test_non_numeric_context_size(
+        self, config_home, runtime_dir, proc_llm_key
+    ):
+        valid_config(config_home)
+        env = base_env(runtime_dir, SLOPON_LLM_CONTEXT_SIZE="big")
+        with pytest.raises(AdaptorConfigError, match="positive integer"):
+            AdaptorConfig.from_env(env)
+
+    @pytest.mark.parametrize("raw", ["0", "-5"])
+    def test_non_positive_context_size(
+        self, config_home, runtime_dir, proc_llm_key, raw
+    ):
+        valid_config(config_home)
+        env = base_env(runtime_dir, SLOPON_LLM_CONTEXT_SIZE=raw)
+        with pytest.raises(AdaptorConfigError, match="positive integer"):
+            AdaptorConfig.from_env(env)
+
+    def test_valid_context_size_lands_on_config(
+        self, config_home, runtime_dir, proc_llm_key
+    ):
+        valid_config(config_home)
+        cfg = AdaptorConfig.from_env(
+            base_env(runtime_dir, SLOPON_LLM_CONTEXT_SIZE="200000")
+        )
+        assert cfg.llm_context_size == 200000
+
+    def test_context_size_agent_env_beats_process_env(
+        self, config_home, monkeypatch, runtime_dir, proc_llm_key
+    ):
+        valid_config(config_home)
+        monkeypatch.setenv("SLOPON_LLM_CONTEXT_SIZE", "111")
+        cfg = AdaptorConfig.from_env(
+            base_env(runtime_dir, SLOPON_LLM_CONTEXT_SIZE="222")
+        )
+        assert cfg.llm_context_size == 222
 
 
 class TestPrecedenceAndSecrets:

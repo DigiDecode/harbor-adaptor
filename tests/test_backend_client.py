@@ -75,13 +75,18 @@ def logger() -> logging.Logger:
 
 
 def make_client(
-    url: str, *, auth_settle_sec: float = 0.15, logger: logging.Logger | None = None
+    url: str,
+    *,
+    auth_settle_sec: float = 0.15,
+    logger: logging.Logger | None = None,
+    on_push=None,
 ) -> SlopOnBackendClient:
     return SlopOnBackendClient(
         url,
         API_KEY,
         logger=logger or logging.getLogger("test"),
         auth_settle_sec=auth_settle_sec,
+        on_push=on_push,
     )
 
 
@@ -223,6 +228,93 @@ async def test_server_push_request_gets_empty_response(logger):
         # before the test tears the connection down.
         await asyncio.sleep(0.2)
         # The fake records our reply to its push in `received`.
+        replies = [m for m in fake.received if m.get("type") == "response"]
+        assert replies == [{"type": "response", "id": "srv-1", "data": {}}]
+        await client.close()
+    finally:
+        await fake.stop()
+
+
+async def test_push_request_surfaced_to_handler_and_answered(logger):
+    received: list[tuple[str, dict]] = []
+
+    async def handler(ws, msg):
+        if msg["method"] == "chat.stream":
+            # Push a compaction-lifecycle notification mid-stream; the
+            # response frame follows it (WS FIFO), so the handler must
+            # have been called before the stream resolves.
+            await ws.send(
+                json.dumps(
+                    {
+                        "type": "request",
+                        "id": "srv-1",
+                        "method": "chat.compactionCompleted",
+                        "params": {
+                            "oldChatId": 1,
+                            "newChatId": 2,
+                            "botId": 3,
+                            "projectId": 4,
+                        },
+                    }
+                )
+            )
+            await ws.send(
+                json.dumps({"type": "response", "id": msg["id"], "data": {"ok": True}})
+            )
+
+    fake = FakeBackend(handler)
+    await fake.start()
+    try:
+        client = make_client(
+            fake.url, logger=logger, on_push=lambda m, p: received.append((m, p))
+        )
+        await client.connect()
+        result = await client.stream("chat.stream", {}, timeout=None)
+        assert result == {"ok": True}
+        assert received == [
+            (
+                "chat.compactionCompleted",
+                {"oldChatId": 1, "newChatId": 2, "botId": 3, "projectId": 4},
+            )
+        ]
+        await asyncio.sleep(0.2)
+        # The empty reply to the push still goes out.
+        replies = [m for m in fake.received if m.get("type") == "response"]
+        assert replies == [{"type": "response", "id": "srv-1", "data": {}}]
+        await client.close()
+    finally:
+        await fake.stop()
+
+
+async def test_raising_on_push_does_not_kill_reader(logger):
+    def exploding_handler(method, params):
+        raise RuntimeError("push sink exploded")
+
+    async def handler(ws, msg):
+        if msg["method"] == "chat.stream":
+            await ws.send(
+                json.dumps(
+                    {
+                        "type": "request",
+                        "id": "srv-1",
+                        "method": "chat.compactionStarted",
+                        "params": {"chatId": 7},
+                    }
+                )
+            )
+            await ws.send(
+                json.dumps({"type": "response", "id": msg["id"], "data": {"ok": True}})
+            )
+
+    fake = FakeBackend(handler)
+    await fake.start()
+    try:
+        client = make_client(fake.url, logger=logger, on_push=exploding_handler)
+        await client.connect()
+        # The stream still resolves despite the raising sink.
+        result = await client.stream("chat.stream", {}, timeout=None)
+        assert result == {"ok": True}
+        await asyncio.sleep(0.2)
         replies = [m for m in fake.received if m.get("type") == "response"]
         assert replies == [{"type": "response", "id": "srv-1", "data": {}}]
         await client.close()

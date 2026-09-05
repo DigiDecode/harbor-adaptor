@@ -5,8 +5,10 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import platform
 import tarfile
 import tempfile
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
@@ -38,6 +40,18 @@ class FakeBackendForAgent:
     stream_gate: asyncio.Event = field(default_factory=asyncio.Event)
     stream_error: Exception | None = None
     chats: list[int] = field(default_factory=list)
+    # Compaction swaps registered by the test: successor id -> compacted id.
+    successors: dict[int, int] = field(default_factory=dict)
+    # Per-chat chat.getTokenUsage payloads (fields only; chatId is added).
+    usage_by_chat: dict[int, dict] = field(default_factory=dict)
+    list_response_override: dict | None = None
+    # Chat whose stream ends with a chat.compactionFailed push delivery.
+    fail_compaction_chat: int | None = None
+    fail_compaction_error: str = "summarizer crashed"
+    # Streams that resolve without the gate — lets tests cancel a later
+    # stream deterministically (single-threaded, no polling races).
+    auto_resolve_streams: int = 0
+    on_push: Callable[[str, dict], None] | None = None
 
     async def connect(self):
         self.connects += 1
@@ -51,6 +65,8 @@ class FakeBackendForAgent:
             return {"items": []}
         if method == "apiProvider.create":
             return {"id": 1}
+        if method == "apiProvider.update":
+            return {"id": params["id"]}
         if method == "config.set":
             return {}
         if method == "runner.create":
@@ -90,6 +106,9 @@ class FakeBackendForAgent:
                 "messages": [{"role": "user", "content": "hello"}],
             }
         if method == "chat.getTokenUsage":
+            usage = self.usage_by_chat.get(params["chatId"])
+            if usage is not None:
+                return {"chatId": params["chatId"], **usage}
             return {
                 "chatId": params["chatId"],
                 "inputTokens": 10,
@@ -98,10 +117,23 @@ class FakeBackendForAgent:
                 "totalTokens": 17,
                 "contextSize": None,
             }
+        if method == "chat.list":
+            if self.list_response_override is not None:
+                return self.list_response_override
+            items = [
+                {"id": successor, "previousChatId": prev}
+                for successor, prev in self.successors.items()
+            ]
+            return {"items": items, "hasMore": False}
         raise AssertionError(f"unexpected method {method}")
 
     def methods(self, name):
         return [params for method, params in self.calls if method == name]
+
+    def push(self, method: str, params: dict) -> None:
+        if self.on_push is None:
+            raise AssertionError("no on_push handler wired on the fake backend")
+        self.on_push(method, params)
 
     async def stream(self, method, params, *, on_chunk=None, timeout=None):
         self.calls.append((method, dict(params)))
@@ -110,6 +142,19 @@ class FakeBackendForAgent:
         # Simulate a chunk then wait for the test to end the stream.
         if on_chunk is not None:
             on_chunk({"text": "delta"})
+        if self.fail_compaction_chat == params.get("chatId"):
+            # Mirror the backend's WS FIFO: the compaction-failure push is
+            # delivered before the stream response resolves.
+            self.push(
+                "chat.compactionFailed",
+                {
+                    "chatId": params["chatId"],
+                    "error": self.fail_compaction_error,
+                },
+            )
+        if self.auto_resolve_streams > 0:
+            self.auto_resolve_streams -= 1
+            return {"chatId": params["chatId"], "messageId": "m1"}
         await self.stream_gate.wait()
         return {"chatId": params["chatId"], "messageId": "m1"}
 
@@ -165,11 +210,14 @@ def env_bundle(tmp_path, monkeypatch):
         encoding="utf-8",
     )
     monkeypatch.setenv("HOME", str(tmp_path))
+    # expanduser() prefers USERPROFILE on Windows.
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
     monkeypatch.setenv("SLOPON_LLM_API_KEY", "llm-key")
     for var in (
         "SLOPON_BACKEND_URL",
         "SLOPON_BACKEND_API_KEY",
         "SLOPON_BACKEND_PUBLIC_URL",
+        "SLOPON_LLM_CONTEXT_SIZE",
     ):
         monkeypatch.delenv(var, raising=False)
 
@@ -191,6 +239,7 @@ def make_agent(env_bundle) -> SlopOnAgent:
         extra_env={
             "SLOPON_RUNNER_RUNTIME": str(env_bundle.runtime),
             "SLOPON_LLM_BASE_URL": "https://llm.example.com/v1",
+            "SLOPON_LLM_CONTEXT_SIZE": "128000",
         },
         logger=logging.getLogger("agent-test"),
     )
@@ -199,11 +248,15 @@ def make_agent(env_bundle) -> SlopOnAgent:
 @pytest.fixture
 def wired_agent(env_bundle, monkeypatch):
     agent = make_agent(env_bundle)
+    # platform.machine() is host-dependent ("AMD64" on Windows x64); the
+    # agent is Linux-only (SUPPORTS_WINDOWS = False) — pin the Linux arch
+    # so setup() is hermetic on any dev host.
+    monkeypatch.setattr(platform, "machine", lambda: "x86_64")
     clients: list[FakeBackendForAgent] = []
     created: list[FakeBackendForAgent] = []
 
-    def factory():
-        client = FakeBackendForAgent()
+    def factory(on_push=None):
+        client = FakeBackendForAgent(on_push=on_push)
         clients.append(client)
         created.append(client)
         return client
@@ -311,8 +364,7 @@ class TestRun:
         await complete_setup(wired_agent.agent, environment)
 
         client = FakeBackendForAgent()
-        wired_agent.clients.append(client)
-        wired_agent.agent._connect = lambda: client
+        wired_agent.agent._connect = lambda on_push=None: client
 
         from harbor.models.agent.context import AgentContext
 
@@ -329,16 +381,28 @@ class TestRun:
             "botId": 31,
             "message": "do the task",
         }
+        # Uncompacted run: exactly one stream and one usage query.
+        assert len(client.methods("chat.stream")) == 1
+        assert len(client.methods("chat.getTokenUsage")) == 1
         # Token usage lands in the context.
         assert context.n_input_tokens == 10
         assert context.n_cache_tokens == 2
         assert context.n_output_tokens == 5
-        # history.json written into logs_dir.
+        assert context.metadata["slopon_chats"] == [
+            {
+                "chatId": 100,
+                "inputTokens": 10,
+                "cacheHitTokens": 2,
+                "outputTokens": 5,
+            }
+        ]
+        # history.json written into logs_dir; no chain file for one chat.
         history = json.loads(
             (wired_agent.env_bundle.logs / "history.json").read_text(encoding="utf-8")
         )
         assert history["chatId"] == 100
         assert history["messages"][0]["role"] == "user"
+        assert not (wired_agent.env_bundle.logs / "history-chain.json").exists()
         assert client.closes == 1
 
     async def test_two_consecutive_runs_both_succeed(self, wired_agent):
@@ -349,8 +413,8 @@ class TestRun:
 
         made = []
 
-        def factory():
-            client = FakeBackendForAgent()
+        def factory(on_push=None):
+            client = FakeBackendForAgent(on_push=on_push)
             client.stream_gate.set()
             made.append(client)
             return client
@@ -372,7 +436,7 @@ class TestRun:
         client.stream_error = BackendRpcError(
             "chat.stream", "RUNNER_OFFLINE", "runner is offline"
         )
-        wired_agent.agent._connect = lambda: client
+        wired_agent.agent._connect = lambda on_push=None: client
 
         from harbor.models.agent.context import AgentContext
 
@@ -389,7 +453,7 @@ class TestRun:
         await complete_setup(wired_agent.agent, environment)
 
         client = FakeBackendForAgent()  # stream_gate never set: blocks
-        wired_agent.agent._connect = lambda: client
+        wired_agent.agent._connect = lambda on_push=None: client
 
         from harbor.models.agent.context import AgentContext
 
@@ -410,6 +474,177 @@ class TestRun:
             (wired_agent.env_bundle.logs / "history.json").read_text(encoding="utf-8")
         )
         assert history["chatId"] == 100
+        assert not (wired_agent.env_bundle.logs / "history-chain.json").exists()
+        assert client.closes == 1
+
+
+async def wire_run_client(wired_agent, client: FakeBackendForAgent):
+    """Point the agent's run-phase _connect at ``client``, wiring on_push."""
+
+    def factory(on_push=None):
+        client.on_push = on_push
+        return client
+
+    wired_agent.agent._connect = factory
+
+
+class TestRunCompaction:
+    async def test_continues_after_compaction_swap(self, wired_agent):
+        environment = FakeEnvironment()
+        await complete_setup(wired_agent.agent, environment)
+
+        client = FakeBackendForAgent()
+        client.stream_gate.set()
+        client.successors[101] = 100
+        client.usage_by_chat = {
+            100: {"inputTokens": 10, "cacheHitTokens": 2, "outputTokens": 5},
+            101: {"inputTokens": 20, "cacheHitTokens": 4, "outputTokens": 6},
+        }
+        await wire_run_client(wired_agent, client)
+
+        from harbor.models.agent.context import AgentContext
+
+        context = AgentContext()
+        await wired_agent.agent.run("do the task", environment, context)
+
+        # Only one chat.create: the successor comes from the backend swap.
+        assert client.methods("chat.create") == [{"botId": 31}]
+        streams = client.methods("chat.stream")
+        assert len(streams) == 2
+        assert streams[0] == {"chatId": 100, "botId": 31, "message": "do the task"}
+        # The continuation stream carries NO message key (resumes from
+        # persisted history) and targets the successor chat.
+        assert streams[1] == {"chatId": 101, "botId": 31}
+        # chat.list queried once per stream end, with the project id.
+        assert client.methods("chat.list") == [{"projectId": 11}, {"projectId": 11}]
+        # Each chat queried exactly once; usage summed across the chain.
+        usage_calls = client.methods("chat.getTokenUsage")
+        assert usage_calls == [{"chatId": 100}, {"chatId": 101}]
+        assert context.n_input_tokens == 30
+        assert context.n_cache_tokens == 6
+        assert context.n_output_tokens == 11
+        assert context.metadata["slopon_chats"] == [
+            {
+                "chatId": 100,
+                "inputTokens": 10,
+                "cacheHitTokens": 2,
+                "outputTokens": 5,
+            },
+            {
+                "chatId": 101,
+                "inputTokens": 20,
+                "cacheHitTokens": 4,
+                "outputTokens": 6,
+            },
+        ]
+        # history.json keeps today's schema for the FINAL chat...
+        history = json.loads(
+            (wired_agent.env_bundle.logs / "history.json").read_text(encoding="utf-8")
+        )
+        assert history["chatId"] == 101
+        # ...and the chain file holds every chat in stream order.
+        chain = json.loads(
+            (wired_agent.env_bundle.logs / "history-chain.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        assert [entry["chatId"] for entry in chain] == [100, 101]
+        assert all(entry["messages"] for entry in chain)
+        assert client.closes == 1
+
+    async def test_compaction_failed_push_fails_the_run(self, wired_agent):
+        environment = FakeEnvironment()
+        await complete_setup(wired_agent.agent, environment)
+
+        client = FakeBackendForAgent()
+        client.stream_gate.set()
+        client.fail_compaction_chat = 100
+        client.fail_compaction_error = "summarizer blew up"
+        await wire_run_client(wired_agent, client)
+
+        from harbor.models.agent.context import AgentContext
+
+        with pytest.raises(RuntimeError, match="compaction failed"):
+            await wired_agent.agent.run("task", environment, AgentContext())
+        payload = json.loads(
+            (wired_agent.env_bundle.logs / "error.json").read_text(encoding="utf-8")
+        )
+        assert payload == {"code": "COMPACTION_FAILED", "message": "summarizer blew up"}
+        # Failed before completion: no history artifacts.
+        assert not (wired_agent.env_bundle.logs / "history.json").exists()
+        assert client.closes == 1
+
+    async def test_chat_list_has_more_fails_the_run_loudly(self, wired_agent):
+        environment = FakeEnvironment()
+        await complete_setup(wired_agent.agent, environment)
+
+        client = FakeBackendForAgent()
+        client.stream_gate.set()
+        client.list_response_override = {
+            "items": [{"id": 101, "previousChatId": 100}],
+            "hasMore": True,
+        }
+        await wire_run_client(wired_agent, client)
+
+        from harbor.models.agent.context import AgentContext
+
+        with pytest.raises(RuntimeError, match="hasMore"):
+            await wired_agent.agent.run("task", environment, AgentContext())
+        assert not (wired_agent.env_bundle.logs / "history.json").exists()
+        assert client.closes == 1
+
+    async def test_two_successors_fail_the_run_loudly(self, wired_agent):
+        environment = FakeEnvironment()
+        await complete_setup(wired_agent.agent, environment)
+
+        client = FakeBackendForAgent()
+        client.stream_gate.set()
+        client.successors = {101: 100, 102: 100}
+        await wire_run_client(wired_agent, client)
+
+        from harbor.models.agent.context import AgentContext
+
+        with pytest.raises(RuntimeError, match="2 successors"):
+            await wired_agent.agent.run("task", environment, AgentContext())
+        assert not (wired_agent.env_bundle.logs / "history.json").exists()
+        assert client.closes == 1
+
+    async def test_cancel_after_swap_targets_successor_and_writes_chain(
+        self, wired_agent
+    ):
+        environment = FakeEnvironment()
+        await complete_setup(wired_agent.agent, environment)
+
+        client = FakeBackendForAgent()
+        # First stream (chat 100) resolves; the successor stream blocks so
+        # the cancellation lands while streaming chat 101.
+        client.auto_resolve_streams = 1
+        client.successors[101] = 100
+        await wire_run_client(wired_agent, client)
+
+        from harbor.models.agent.context import AgentContext
+
+        task = asyncio.create_task(
+            wired_agent.agent.run("long task", environment, AgentContext())
+        )
+        while len(client.methods("chat.stream")) < 2:
+            await asyncio.sleep(0.01)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        # stopStream targets the most recent chat id at cancel time.
+        assert client.methods("chat.stopStream") == [{"chatId": 101}]
+        history = json.loads(
+            (wired_agent.env_bundle.logs / "history.json").read_text(encoding="utf-8")
+        )
+        assert history["chatId"] == 101
+        chain = json.loads(
+            (wired_agent.env_bundle.logs / "history-chain.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        assert [entry["chatId"] for entry in chain] == [100, 101]
         assert client.closes == 1
 
 

@@ -126,6 +126,7 @@ class AdaptorConfig:
     llm_base_url: str
     llm_api_key: str
     llm_model_id: str
+    llm_context_size: int
     runner_online_timeout_sec: float
     node_version: str
 
@@ -217,6 +218,23 @@ class AdaptorConfig:
                 )
             llm_model_id = model_name
 
+        context_raw = resolve("SLOPON_LLM_CONTEXT_SIZE")
+        if not context_raw:
+            raise AdaptorConfigError(
+                "SLOPON_LLM_CONTEXT_SIZE is required (agent env or harbor process "
+                "env): the model context window in tokens. Compaction is always "
+                "on; without it the backend compaction stop condition never fires."
+            )
+        try:
+            llm_context_size = int(context_raw)
+        except ValueError:
+            llm_context_size = -1  # fall through to the range check below
+        if llm_context_size <= 0:
+            raise AdaptorConfigError(
+                f"SLOPON_LLM_CONTEXT_SIZE must be a positive integer (tokens), "
+                f"got {context_raw!r}"
+            )
+
         runtime_raw = resolve("SLOPON_RUNNER_RUNTIME")
         if not runtime_raw:
             raise AdaptorConfigError(
@@ -263,6 +281,7 @@ class AdaptorConfig:
             llm_base_url=llm_base_url,
             llm_api_key=llm_api_key,
             llm_model_id=llm_model_id,
+            llm_context_size=llm_context_size,
             runner_online_timeout_sec=online_timeout,
             node_version=node_version,
         )

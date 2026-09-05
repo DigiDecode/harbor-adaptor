@@ -74,6 +74,14 @@ class FakeClient:
             row = {"id": self._next_id(self.providers), **params}
             self.providers.append(row)
             return dict(row)
+        if method == "apiProvider.update":
+            for row in self.providers:
+                if row["id"] == params["id"]:
+                    row.update(params)
+                    return dict(row)
+            raise AssertionError(
+                f"apiProvider.update for unknown id {params.get('id')!r}"
+            )
         if method == "config.set":
             self.config_rows[params["key"]] = params["value"]
             return {"key": params["key"], "value": params["value"]}
@@ -132,6 +140,7 @@ def config() -> AdaptorConfig:
         llm_base_url="https://llm.example.com/v1",
         llm_api_key="llm-key",
         llm_model_id="model-x",
+        llm_context_size=128000,
         runner_online_timeout_sec=0.3,
         node_version="v22.17.1",
     )
@@ -173,11 +182,38 @@ class TestProvider:
         provider_id = await provisioner.ensure_provider()
         assert provider_id == 77
         assert len(client.methods("apiProvider.create")) == 1
+        # The contextSize gate is asserted on the raced row too.
+        assert client.methods("apiProvider.update") == [
+            {"id": 77, "contextSize": 128000}
+        ]
 
-    async def test_compaction_disabled(self, config):
+    async def test_compaction_enabled_config_written(self, config):
         client = FakeClient()
         await full_flow(client, config)
-        assert client.config_rows.get("global.context-compaction.enabled") == "false"
+        assert client.config_rows.get("global.context-compaction.enabled") == "true"
+
+    async def test_provider_context_size_asserted(self, config):
+        client = FakeClient()
+        resources = await full_flow(client, config)
+        expected = {
+            "id": resources.provider_id,
+            "contextSize": config.llm_context_size,
+        }
+        # Params asserted, not an exact count: the update legitimately
+        # fires on both ensure_provider call sites per trial.
+        assert expected in client.methods("apiProvider.update")
+
+    async def test_provider_context_size_reasserted_on_reuse(self, config):
+        client = FakeClient()
+        await full_flow(client, config)
+        updates_after_first = len(client.methods("apiProvider.update"))
+        assert updates_after_first >= 1
+        await full_flow(client, config)
+        updates = client.methods("apiProvider.update")
+        assert len(updates) > updates_after_first
+        provider_id = client.providers[0]["id"]
+        for update in updates:
+            assert update == {"id": provider_id, "contextSize": 128000}
 
 
 class TestRunnerAndProject:

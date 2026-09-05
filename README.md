@@ -104,6 +104,7 @@ harbor trials start -p examples/tasks/hello-world \
   -m <model_id> \
   --ae SLOPON_RUNNER_RUNTIME=/abs/path/slopon-runtime \
   --ae SLOPON_LLM_BASE_URL=<llm-base-url> \
+  --ae SLOPON_LLM_CONTEXT_SIZE=<model-context-window-in-tokens> \
   --agent-setup-timeout 600 \
   --agent-timeout 900
 ```
@@ -113,8 +114,10 @@ adaptor bootstraps curl via apt and then installs the pinned Node v22.x
 `.tar.gz` from nodejs.org during setup (this is why the setup timeout is
 raised). Expected artifacts after the trial:
 `trial_dir/agent/history.json` (final chat transcript from
-`chat.getHistory`) and `trial_dir/agent/runner.log`; a verifier reward is
-produced as usual.
+`chat.getHistory`), `trial_dir/agent/history-chain.json` (all chats of
+the run in stream order — present only when the backend compacted the
+context mid-run and the agent continued in successor chats),
+`trial_dir/agent/runner.log`; a verifier reward is produced as usual.
 
 ## 5. Job / concurrency
 
@@ -167,9 +170,18 @@ dialed.
 
 - **Row accumulation**: every trial adds a runner row, project (+5 seeded
   bots, 4 phases), source folder, benchmark bot, chat + messages, and
-  config rows (compaction disabled globally once; per-tool approval
-  overrides per project). SQLite rows accumulate by design; teardown is
-  a separate follow-up task.
+  config rows (per-tool approval overrides per project; compaction is
+  asserted enabled globally on every setup, overwriting the same row).
+  SQLite rows accumulate by design; teardown is a separate follow-up task.
+- **Context compaction is always-on**: every setup asserts
+  `global.context-compaction.enabled = 'true'` (self-healing `'false'`
+  rows written by older adaptors) and the provider `contextSize` via
+  `apiProvider.update`. When the backend compacts a chat mid-run, the
+  agent continues streaming the successor chat (resumed from persisted
+  history) until the task completes; each swap adds another chat row.
+  `SLOPON_LLM_CONTEXT_SIZE` must be set to the model's full context
+  window in tokens — without it the backend's compaction stop condition
+  never fires and trials would silently truncate.
 - **Credential rotation** = fresh benchmark instance (fresh `~/.slopon`).
 - **Backend restart mid-trial** orphans in-flight jobs (known backend
   limitation): restart the benchmark job; the DB is disposable.
@@ -199,6 +211,7 @@ dialed.
 | `SLOPON_LLM_BASE_URL` | **yes** | agent env / process env | LLM provider base URL (non-secret). |
 | `SLOPON_LLM_API_KEY` | **yes** | **process env only** | LLM provider key. |
 | `SLOPON_LLM_MODEL_ID` | **yes*** | agent env / process env | Falls back to harbor `-m/--model`. |
+| `SLOPON_LLM_CONTEXT_SIZE` | **yes** | agent env / process env | Model context window in tokens (full window, not output cap); drives the backend compaction threshold (compaction is always-on; a missing/invalid value fails fast at config load). |
 | `SLOPON_RUNNER_ONLINE_TIMEOUT_SEC` | no | agent env / process env | Default `90`. |
 | `SLOPON_NODE_VERSION` | no | agent env / process env | Pinned Node; default `22.17.1`, major must be 22. |
 

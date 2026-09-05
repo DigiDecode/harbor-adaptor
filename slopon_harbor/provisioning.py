@@ -6,9 +6,14 @@ authenticated client connection:
 1. ``ensure_provider`` — reuse the benchmark provider row by name, create
    it on first use (never sending ``reasoningEffort`` — the service
    defaults it to ``'high'`` and an explicit ``null`` breaks
-   ``openai_compatible`` providers).
-2. ``disable_compaction_once`` — global ``config.set`` flipping off
-   context compaction so mid-run chat ids never swap.
+   ``openai_compatible`` providers), then assert the provider
+   ``contextSize`` compaction gate via ``apiProvider.update`` (rows
+   created before compaction was enabled lack it).
+2. ``ensure_compaction_enabled`` — global ``config.set`` asserting
+   ``global.context-compaction.enabled = 'true'`` on every setup
+   (self-heals ``'false'`` rows written by older adaptor versions;
+   compacted chats swap mid-run and the agent continues in the
+   successor chat).
 3. ``create_runner`` — runner row with a per-run random suffix (duplicate
    names are rejected backend-wide and tokens are unrecoverable).
 4. ``wait_runner_online`` — poll ``runner.list`` until the in-container
@@ -131,26 +136,39 @@ class TrialProvisioner:
     # ── steps 1-3: before the container runner starts ────────────────────
 
     async def create_runner_resources(self) -> tuple[int, str]:
-        """Steps 1-3: provider, compaction off, runner row.
+        """Steps 1-3: provider, compaction enable-assert, runner row.
 
         Returns ``(runner_id, runner_token)``. The token plaintext is
         returned exactly once by ``runner.create`` and never logged.
         """
         await self.ensure_provider()
-        await self.disable_compaction_once()
+        await self.ensure_compaction_enabled()
         runner_id, runner_token = await self.create_runner()
         return runner_id, runner_token
 
     async def ensure_provider(self) -> int:
-        if self._provider_id is not None:
-            return self._provider_id
+        if self._provider_id is None:
+            self._provider_id = await self._find_or_create_provider()
+        # apiProvider.update is the only RPC accepting contextSize, and
+        # reused rows created before this adaptor version lack it — assert
+        # the compaction gate on every setup. Idempotent: fires once per
+        # ensure_provider() call site (twice per trial by design).
+        await self._client.call(
+            "apiProvider.update",
+            {
+                "id": self._provider_id,
+                "contextSize": self._config.llm_context_size,
+            },
+        )
+        return self._provider_id
+
+    async def _find_or_create_provider(self) -> int:
         name = f"{PROVIDER_NAME_PREFIX}{self._config.llm_type}"
         listing = await self._client.call("apiProvider.listAll", {})
         for item in listing.get("items", []):
             if item.get("name") == name:
                 self._logger.info("reusing api provider %r (id=%s)", name, item["id"])
-                self._provider_id = int(item["id"])
-                return self._provider_id
+                return int(item["id"])
         try:
             created = await self._client.call(
                 "apiProvider.create",
@@ -169,17 +187,17 @@ class TrialProvisioner:
             listing = await self._client.call("apiProvider.listAll", {})
             for item in listing.get("items", []):
                 if item.get("name") == name:
-                    self._provider_id = int(item["id"])
-                    return self._provider_id
+                    return int(item["id"])
             raise
-        self._provider_id = int(created["id"])
-        return self._provider_id
+        return int(created["id"])
 
-    async def disable_compaction_once(self) -> None:
-        # Idempotent; only the first trial per backend has any effect.
+    async def ensure_compaction_enabled(self) -> None:
+        # Idempotent. Writes 'true' (never deletes) because an explicit
+        # 'false' row — written by adaptor versions before compaction was
+        # enabled — overrides the backend seed default forever.
         await self._client.call(
             "config.set",
-            {"key": COMPACTION_CONFIG_KEY, "value": "false"},
+            {"key": COMPACTION_CONFIG_KEY, "value": "true"},
         )
 
     async def create_runner(self) -> tuple[int, str]:

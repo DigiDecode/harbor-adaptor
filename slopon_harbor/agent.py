@@ -2,28 +2,36 @@
 
 Lifecycle:
 
-- ``setup()`` provisions the backend side (provider, compaction off,
-  runner row), then the in-container side (Node, runtime tarball upload +
-  unpack, gateway discovery, runner start), waits for the runner to come
-  online and finishes backend provisioning (project, source folder, bot,
-  approval overrides). The setup-phase client connection is closed at the
-  end.
+- ``setup()`` provisions the backend side (provider with a ``contextSize``
+  compaction-gate assertion, compaction enable-assert, runner row), then
+  the in-container side (Node, runtime tarball upload + unpack, gateway
+  discovery, runner start), waits for the runner to come online and
+  finishes backend provisioning (project, source folder, bot, approval
+  overrides). The setup-phase client connection is closed at the end.
 - ``run()`` opens a fresh client connection per call (harbor invokes
   ``run()`` once per step on multi-step tasks and ``BaseAgent`` has no
   teardown hook), pre-creates the chat explicitly so a cancelled stream
-  can still be stopped and read back, streams with no client deadline
-  (harbor's ``asyncio.wait_for`` owns cancellation), records token usage
-  into the context, and writes ``history.json`` next to the agent logs.
+  can still be stopped and read back, and streams with no client deadline
+  (harbor's ``asyncio.wait_for`` owns cancellation). Context compaction
+  is always on: when the backend swaps the chat mid-stream, ``run()``
+  re-streams the successor chat (no ``message`` — the backend resumes
+  from persisted history) until a stream ends with no successor, then
+  records the summed token usage of every chat in the chain into the
+  context and writes ``history.json`` (final chat) plus
+  ``history-chain.json`` (all chats, multi-chat runs only) next to the
+  agent logs.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import platform
 import re
 import tempfile
 from pathlib import Path
+from typing import Any
 
 from harbor.agents.base import BaseAgent
 from harbor.environments.base import BaseEnvironment
@@ -33,6 +41,7 @@ from slopon_harbor import __version__
 from slopon_harbor.backend_client import (
     BackendClientError,
     BackendRpcError,
+    PushCallback,
     SlopOnBackendClient,
 )
 from slopon_harbor.config import AdaptorConfig
@@ -49,10 +58,51 @@ from slopon_harbor.container import (
 from slopon_harbor.provisioning import TrialProvisioner
 
 HISTORY_FILENAME = "history.json"
+CHAIN_HISTORY_FILENAME = "history-chain.json"
 ERROR_FILENAME = "error.json"
 POST_CANCEL_CALL_TIMEOUT_SEC = 10.0
+METADATA_CHATS_KEY = "slopon_chats"
+COMPACTION_FAILED_CODE = "COMPACTION_FAILED"
 
 _IPV4_RE = re.compile(r"(?:\d{1,3}\.){3}\d{1,3}")
+
+
+class _CompactionWatch:
+    """``on_push`` sink for the compaction lifecycle pushes of one ``run()``.
+
+    Invoked synchronously on the client's reader loop, so it only logs and
+    records — never blocks. ``chat.compactionFailed`` is the only failure
+    signal a failed compaction produces (no DB trace is left behind), so
+    the recorded entry is checked after every stream end.
+    """
+
+    def __init__(self, logger: logging.Logger):
+        self._logger = logger
+        self.failures: dict[int, str] = {}
+
+    def __call__(self, method: str, params: dict[str, Any]) -> None:
+        if method == "chat.compactionStarted":
+            self._logger.info("compaction started for chat %s", params.get("chatId"))
+        elif method == "chat.compactionCompleted":
+            self._logger.info(
+                "compaction completed: chat %s -> chat %s",
+                params.get("oldChatId"),
+                params.get("newChatId"),
+            )
+        elif method == "chat.compactionFailed":
+            raw_id = params.get("chatId")
+            error = str(params.get("error") or "unknown error")
+            try:
+                chat_id = int(raw_id)
+            except (TypeError, ValueError):
+                self._logger.warning(
+                    "compaction failed push has unusable chatId %r: %s",
+                    raw_id,
+                    error,
+                )
+                return
+            self.failures[chat_id] = error
+            self._logger.warning("compaction failed for chat %s: %s", chat_id, error)
 
 
 class SlopOnAgent(BaseAgent):
@@ -73,11 +123,12 @@ class SlopOnAgent(BaseAgent):
 
     # ── helpers ──────────────────────────────────────────────────────────
 
-    def _connect(self) -> SlopOnBackendClient:
+    def _connect(self, on_push: PushCallback | None = None) -> SlopOnBackendClient:
         client = SlopOnBackendClient(
             self._config.backend_url,
             self._config.backend_api_key,
             logger=self.logger,
+            on_push=on_push,
         )
         return client
 
@@ -111,7 +162,7 @@ class SlopOnAgent(BaseAgent):
                 logger=self.logger,
             )
 
-            # Steps 1-3: provider, compaction off, runner row + token.
+            # Steps 1-3: provider, compaction enable-assert, runner row + token.
             runner_id, runner_token = (
                 await self._provisioner.create_runner_resources()
             )
@@ -213,27 +264,75 @@ class SlopOnAgent(BaseAgent):
         if self._provisioner is None or self._resources is None:
             raise RuntimeError("setup() has not completed; cannot run")
         bot_id = self._resources.bot_id
+        project_id = self._resources.project_id
 
-        client = self._connect()
+        watch = _CompactionWatch(self.logger)
+        client = self._connect(on_push=watch)
         try:
             await client.connect()
             chat = await client.call("chat.create", {"botId": bot_id})
-            chat_id = int(chat["id"])
+            first_chat_id = int(chat["id"])
+            chain = [first_chat_id]
+            current = first_chat_id
 
             def on_chunk(data) -> None:
                 self.logger.debug("chat chunk: %s", data)
 
+            input_tokens = cache_tokens = output_tokens = 0
+            breakdown: list[dict[str, Any]] = []
             try:
-                await client.stream(
-                    "chat.stream",
-                    {"chatId": chat_id, "botId": bot_id, "message": instruction},
-                    on_chunk=on_chunk,
-                    timeout=None,
-                )
+                while True:
+                    params: dict[str, Any] = {"chatId": current, "botId": bot_id}
+                    if current == first_chat_id:
+                        # Only the first stream carries the instruction; a
+                        # compacted successor resumes from persisted history.
+                        params["message"] = instruction
+                    await client.stream(
+                        "chat.stream", params, on_chunk=on_chunk, timeout=None
+                    )
+                    # Each chat's usage is queried exactly once, as soon as
+                    # its stream ends; the failure path below exits before
+                    # any accounting matters.
+                    usage = await client.call(
+                        "chat.getTokenUsage", {"chatId": current}
+                    )
+                    input_tokens += usage.get("inputTokens") or 0
+                    cache_tokens += usage.get("cacheHitTokens") or 0
+                    output_tokens += usage.get("outputTokens") or 0
+                    breakdown.append(
+                        {
+                            "chatId": current,
+                            "inputTokens": usage.get("inputTokens"),
+                            "cacheHitTokens": usage.get("cacheHitTokens"),
+                            "outputTokens": usage.get("outputTokens"),
+                        }
+                    )
+                    failure = watch.failures.get(current)
+                    if failure is not None:
+                        self._write_json(
+                            ERROR_FILENAME,
+                            {"code": COMPACTION_FAILED_CODE, "message": failure},
+                        )
+                        raise RuntimeError(
+                            f"backend compaction failed for chat {current}: "
+                            f"{failure}"
+                        )
+                    successor = await self._find_successor(
+                        client, project_id, current
+                    )
+                    if successor is None:
+                        break
+                    self.logger.info(
+                        "chat %s was compacted; continuing in chat %s",
+                        current,
+                        successor,
+                    )
+                    chain.append(successor)
+                    current = successor
             except asyncio.CancelledError:
                 # Harbor's agent-phase timeout/abort: stop the stream
                 # best-effort, salvage the partial transcript, re-raise.
-                await self._salvage_after_cancel(client, chat_id)
+                await self._salvage_after_cancel(client, current, chain)
                 raise
             except BackendRpcError as err:
                 self._write_json(
@@ -241,19 +340,73 @@ class SlopOnAgent(BaseAgent):
                 )
                 raise
 
-            usage = await client.call("chat.getTokenUsage", {"chatId": chat_id})
-            context.n_input_tokens = usage.get("inputTokens")
-            context.n_cache_tokens = usage.get("cacheHitTokens")
-            context.n_output_tokens = usage.get("outputTokens")
+            context.n_input_tokens = input_tokens
+            context.n_cache_tokens = cache_tokens
+            context.n_output_tokens = output_tokens
+            context.metadata = {
+                **(context.metadata or {}),
+                METADATA_CHATS_KEY: breakdown,
+            }
 
-            history = await client.call("chat.getHistory", {"chatId": chat_id})
-            self._write_json(HISTORY_FILENAME, history)
+            final_history = await client.call("chat.getHistory", {"chatId": current})
+            self._write_json(HISTORY_FILENAME, final_history)
+            if len(chain) > 1:
+                entries = [
+                    await client.call("chat.getHistory", {"chatId": chat_id})
+                    for chat_id in chain[:-1]
+                ]
+                entries.append(final_history)
+                self._write_json(CHAIN_HISTORY_FILENAME, entries)
         finally:
             await client.close()
 
+    async def _find_successor(
+        self, client: SlopOnBackendClient, project_id: int, chat_id: int
+    ) -> int | None:
+        """Return the compaction successor of ``chat_id``, or ``None``.
+
+        The backend commits the swap (``previousChatId`` on the successor)
+        before the stream response resolves, so one ``chat.list`` per
+        stream end is race-free.
+        """
+        listing = await client.call("chat.list", {"projectId": project_id})
+        items = listing.get("items", [])
+        if listing.get("hasMore"):
+            # A paged-away successor must never be misread as "no
+            # successor" (the default page is 50; per-trial projects sit
+            # far below it, so this is a tripwire, not a working path).
+            raise RuntimeError(
+                f"chat.list for project {project_id} returned hasMore=true "
+                f"({len(items)} items on the page); a compaction successor "
+                "could be paged away — refusing to guess"
+            )
+        successors = [
+            int(item["id"])
+            for item in items
+            if item.get("previousChatId") == chat_id
+        ]
+        if not successors:
+            return None
+        if len(successors) > 1:
+            # CompactionService creates exactly one successor and nothing
+            # else in the benchmark flow writes previousChatId; more than
+            # one match is an anomalous backend state — never pick one.
+            raise RuntimeError(
+                f"chat.list returned {len(successors)} successors of chat "
+                f"{chat_id}: {successors}; expected at most one"
+            )
+        return successors[0]
+
     async def _salvage_after_cancel(
-        self, client: SlopOnBackendClient, chat_id: int
+        self, client: SlopOnBackendClient, chat_id: int, chain: list[int]
     ) -> None:
+        """Best-effort stop + partial-transcript salvage after cancellation.
+
+        ``chat_id`` is the most recent chat at cancel time; artifacts
+        follow the completed-run layout (final chat plus the chain file
+        for multi-chat runs), each call individually bounded by
+        ``POST_CANCEL_CALL_TIMEOUT_SEC``.
+        """
         try:
             await asyncio.wait_for(
                 client.call("chat.stopStream", {"chatId": chat_id}),
@@ -261,16 +414,36 @@ class SlopOnAgent(BaseAgent):
             )
         except (BackendClientError, TimeoutError):
             self.logger.warning("chat.stopStream best-effort call failed")
+        final_history: dict[str, Any] | None = None
         try:
-            history = await asyncio.wait_for(
+            final_history = await asyncio.wait_for(
                 client.call("chat.getHistory", {"chatId": chat_id}),
                 timeout=POST_CANCEL_CALL_TIMEOUT_SEC,
             )
-            self._write_json(HISTORY_FILENAME, history)
+            self._write_json(HISTORY_FILENAME, final_history)
         except (BackendClientError, TimeoutError):
             self.logger.warning(
                 "could not fetch partial history for chat %s", chat_id
             )
+        if len(chain) <= 1:
+            return
+        entries: list[dict[str, Any]] = []
+        for earlier_id in chain[:-1]:
+            try:
+                entries.append(
+                    await asyncio.wait_for(
+                        client.call("chat.getHistory", {"chatId": earlier_id}),
+                        timeout=POST_CANCEL_CALL_TIMEOUT_SEC,
+                    )
+                )
+            except (BackendClientError, TimeoutError):
+                self.logger.warning(
+                    "could not fetch partial history for chat %s", earlier_id
+                )
+                return
+        if final_history is not None:
+            entries.append(final_history)
+            self._write_json(CHAIN_HISTORY_FILENAME, entries)
 
     def _write_json(self, filename: str, payload) -> None:
         self.logs_dir.mkdir(parents=True, exist_ok=True)
