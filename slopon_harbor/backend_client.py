@@ -327,8 +327,9 @@ class SlopOnBackendClient:
             return
         if mtype == "request":
             # Server-initiated push (e.g. tool approval requests to the
-            # desktop client, compaction lifecycle notifications to this
-            # adaptor). Forward to the registered handler, then answer with
+            # desktop client, compaction started/failed notifications to
+            # this adaptor — the completed push is a UI-only broadcast).
+            # Forward to the registered handler, then answer with
             # an empty response exactly as the reference client does for
             # unknown methods (the backend treats that as "handled").
             method = msg.get("method")

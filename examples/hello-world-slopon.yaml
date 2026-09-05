@@ -24,6 +24,7 @@ agents:
     env:
       SLOPON_RUNNER_RUNTIME: /abs/path/slopon-runtime
       SLOPON_LLM_BASE_URL: https://llm-provider.example.com/v1
+      SLOPON_LLM_CONTEXT_SIZE: 131072 # model's full context window in tokens
     # hello-world defaults to 'public' networking, where these lists are
     # inert. For 'allowlist' tasks, the backend address must appear in BOTH
     # lists (the runner connects during setup() as well as during run()),

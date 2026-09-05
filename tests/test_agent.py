@@ -40,11 +40,15 @@ class FakeBackendForAgent:
     stream_gate: asyncio.Event = field(default_factory=asyncio.Event)
     stream_error: Exception | None = None
     chats: list[int] = field(default_factory=list)
-    # Compaction swaps registered by the test: successor id -> compacted id.
-    successors: dict[int, int] = field(default_factory=dict)
+    # Compaction swaps registered by the test: chat id -> successor id.
+    continuations: dict[int, int] = field(default_factory=dict)
+    # True models a pre-task-372 backend: chat.get omits the
+    # continuationChatId key entirely instead of returning null.
+    omit_continuation_key: bool = False
     # Per-chat chat.getTokenUsage payloads (fields only; chatId is added).
     usage_by_chat: dict[int, dict] = field(default_factory=dict)
-    list_response_override: dict | None = None
+    # Chat whose post-run chat.getHistory fetch fails.
+    fail_get_history_chat: int | None = None
     # Chat whose stream ends with a chat.compactionFailed push delivery.
     fail_compaction_chat: int | None = None
     fail_compaction_error: str = "summarizer crashed"
@@ -101,6 +105,10 @@ class FakeBackendForAgent:
         if method == "chat.stopStream":
             return {"stopped": True}
         if method == "chat.getHistory":
+            if params["chatId"] == self.fail_get_history_chat:
+                raise BackendRpcError(
+                    "chat.getHistory", "HISTORY_FETCH_FAILED", "chat row missing"
+                )
             return {
                 "chatId": params["chatId"],
                 "messages": [{"role": "user", "content": "hello"}],
@@ -117,14 +125,12 @@ class FakeBackendForAgent:
                 "totalTokens": 17,
                 "contextSize": None,
             }
-        if method == "chat.list":
-            if self.list_response_override is not None:
-                return self.list_response_override
-            items = [
-                {"id": successor, "previousChatId": prev}
-                for successor, prev in self.successors.items()
-            ]
-            return {"items": items, "hasMore": False}
+        if method == "chat.get":
+            chat_id = params["chatId"]
+            response: dict = {"id": chat_id}
+            if not self.omit_continuation_key:
+                response["continuationChatId"] = self.continuations.get(chat_id)
+            return response
         raise AssertionError(f"unexpected method {method}")
 
     def methods(self, name):
@@ -495,7 +501,7 @@ class TestRunCompaction:
 
         client = FakeBackendForAgent()
         client.stream_gate.set()
-        client.successors[101] = 100
+        client.continuations[100] = 101
         client.usage_by_chat = {
             100: {"inputTokens": 10, "cacheHitTokens": 2, "outputTokens": 5},
             101: {"inputTokens": 20, "cacheHitTokens": 4, "outputTokens": 6},
@@ -515,8 +521,8 @@ class TestRunCompaction:
         # The continuation stream carries NO message key (resumes from
         # persisted history) and targets the successor chat.
         assert streams[1] == {"chatId": 101, "botId": 31}
-        # chat.list queried once per stream end, with the project id.
-        assert client.methods("chat.list") == [{"projectId": 11}, {"projectId": 11}]
+        # chat.get queried once per stream end for successor detection.
+        assert client.methods("chat.get") == [{"chatId": 100}, {"chatId": 101}]
         # Each chat queried exactly once; usage summed across the chain.
         usage_calls = client.methods("chat.getTokenUsage")
         assert usage_calls == [{"chatId": 100}, {"chatId": 101}]
@@ -574,38 +580,63 @@ class TestRunCompaction:
         assert not (wired_agent.env_bundle.logs / "history.json").exists()
         assert client.closes == 1
 
-    async def test_chat_list_has_more_fails_the_run_loudly(self, wired_agent):
+    async def test_missing_continuation_key_fails_loudly(self, wired_agent):
         environment = FakeEnvironment()
         await complete_setup(wired_agent.agent, environment)
 
         client = FakeBackendForAgent()
         client.stream_gate.set()
-        client.list_response_override = {
-            "items": [{"id": 101, "previousChatId": 100}],
-            "hasMore": True,
-        }
+        client.omit_continuation_key = True
         await wire_run_client(wired_agent, client)
 
         from harbor.models.agent.context import AgentContext
 
-        with pytest.raises(RuntimeError, match="hasMore"):
+        with pytest.raises(RuntimeError, match="predates task-372"):
             await wired_agent.agent.run("task", environment, AgentContext())
         assert not (wired_agent.env_bundle.logs / "history.json").exists()
         assert client.closes == 1
 
-    async def test_two_successors_fail_the_run_loudly(self, wired_agent):
+    async def test_self_referential_continuation_fails_loudly(self, wired_agent):
         environment = FakeEnvironment()
         await complete_setup(wired_agent.agent, environment)
 
         client = FakeBackendForAgent()
         client.stream_gate.set()
-        client.successors = {101: 100, 102: 100}
+        client.continuations[100] = 100
         await wire_run_client(wired_agent, client)
 
         from harbor.models.agent.context import AgentContext
 
-        with pytest.raises(RuntimeError, match="2 successors"):
+        with pytest.raises(RuntimeError, match="own continuation"):
             await wired_agent.agent.run("task", environment, AgentContext())
+        assert not (wired_agent.env_bundle.logs / "history.json").exists()
+        assert client.closes == 1
+
+    async def test_history_failure_after_stream_writes_error_json(
+        self, wired_agent
+    ):
+        environment = FakeEnvironment()
+        await complete_setup(wired_agent.agent, environment)
+
+        client = FakeBackendForAgent()
+        client.stream_gate.set()
+        client.fail_get_history_chat = 100
+        await wire_run_client(wired_agent, client)
+
+        from harbor.models.agent.context import AgentContext
+
+        context = AgentContext()
+        with pytest.raises(BackendRpcError):
+            await wired_agent.agent.run("task", environment, context)
+        payload = json.loads(
+            (wired_agent.env_bundle.logs / "error.json").read_text(encoding="utf-8")
+        )
+        assert payload == {
+            "code": "HISTORY_FETCH_FAILED",
+            "message": "chat row missing",
+        }
+        # Accounting ran before the artifact fetch: it stays recorded.
+        assert context.n_input_tokens == 10
         assert not (wired_agent.env_bundle.logs / "history.json").exists()
         assert client.closes == 1
 
@@ -619,7 +650,7 @@ class TestRunCompaction:
         # First stream (chat 100) resolves; the successor stream blocks so
         # the cancellation lands while streaming chat 101.
         client.auto_resolve_streams = 1
-        client.successors[101] = 100
+        client.continuations[100] = 101
         await wire_run_client(wired_agent, client)
 
         from harbor.models.agent.context import AgentContext

@@ -73,7 +73,11 @@ class _CompactionWatch:
     Invoked synchronously on the client's reader loop, so it only logs and
     records — never blocks. ``chat.compactionFailed`` is the only failure
     signal a failed compaction produces (no DB trace is left behind), so
-    the recorded entry is checked after every stream end.
+    the recorded entry is checked after every stream end. Only
+    ``started``/``failed`` target the streaming connection;
+    ``completed`` is a UI-only broadcast (``broadcastToUiClients`` gates
+    on ``isUi``) a non-UI adaptor never receives — the run's own
+    per-hop successor log is the surviving completion observability.
     """
 
     def __init__(self, logger: logging.Logger):
@@ -83,12 +87,6 @@ class _CompactionWatch:
     def __call__(self, method: str, params: dict[str, Any]) -> None:
         if method == "chat.compactionStarted":
             self._logger.info("compaction started for chat %s", params.get("chatId"))
-        elif method == "chat.compactionCompleted":
-            self._logger.info(
-                "compaction completed: chat %s -> chat %s",
-                params.get("oldChatId"),
-                params.get("newChatId"),
-            )
         elif method == "chat.compactionFailed":
             raw_id = params.get("chatId")
             error = str(params.get("error") or "unknown error")
@@ -264,7 +262,6 @@ class SlopOnAgent(BaseAgent):
         if self._provisioner is None or self._resources is None:
             raise RuntimeError("setup() has not completed; cannot run")
         bot_id = self._resources.bot_id
-        project_id = self._resources.project_id
 
         watch = _CompactionWatch(self.logger)
         client = self._connect(on_push=watch)
@@ -317,9 +314,7 @@ class SlopOnAgent(BaseAgent):
                             f"backend compaction failed for chat {current}: "
                             f"{failure}"
                         )
-                    successor = await self._find_successor(
-                        client, project_id, current
-                    )
+                    successor = await self._find_successor(client, current)
                     if successor is None:
                         break
                     self.logger.info(
@@ -329,6 +324,26 @@ class SlopOnAgent(BaseAgent):
                     )
                     chain.append(successor)
                     current = successor
+
+                context.n_input_tokens = input_tokens
+                context.n_cache_tokens = cache_tokens
+                context.n_output_tokens = output_tokens
+                context.metadata = {
+                    **(context.metadata or {}),
+                    METADATA_CHATS_KEY: breakdown,
+                }
+
+                final_history = await client.call(
+                    "chat.getHistory", {"chatId": current}
+                )
+                self._write_json(HISTORY_FILENAME, final_history)
+                if len(chain) > 1:
+                    entries = [
+                        await client.call("chat.getHistory", {"chatId": chat_id})
+                        for chat_id in chain[:-1]
+                    ]
+                    entries.append(final_history)
+                    self._write_json(CHAIN_HISTORY_FILENAME, entries)
             except asyncio.CancelledError:
                 # Harbor's agent-phase timeout/abort: stop the stream
                 # best-effort, salvage the partial transcript, re-raise.
@@ -339,63 +354,39 @@ class SlopOnAgent(BaseAgent):
                     ERROR_FILENAME, {"code": err.code, "message": err.message}
                 )
                 raise
-
-            context.n_input_tokens = input_tokens
-            context.n_cache_tokens = cache_tokens
-            context.n_output_tokens = output_tokens
-            context.metadata = {
-                **(context.metadata or {}),
-                METADATA_CHATS_KEY: breakdown,
-            }
-
-            final_history = await client.call("chat.getHistory", {"chatId": current})
-            self._write_json(HISTORY_FILENAME, final_history)
-            if len(chain) > 1:
-                entries = [
-                    await client.call("chat.getHistory", {"chatId": chat_id})
-                    for chat_id in chain[:-1]
-                ]
-                entries.append(final_history)
-                self._write_json(CHAIN_HISTORY_FILENAME, entries)
         finally:
             await client.close()
 
     async def _find_successor(
-        self, client: SlopOnBackendClient, project_id: int, chat_id: int
+        self, client: SlopOnBackendClient, chat_id: int
     ) -> int | None:
         """Return the compaction successor of ``chat_id``, or ``None``.
 
-        The backend commits the swap (``previousChatId`` on the successor)
-        before the stream response resolves, so one ``chat.list`` per
-        stream end is race-free.
+        ``chat.get`` resolves ``continuationChatId`` server-side — the
+        latest chat with ``previousChatId = chat_id`` — in the same
+        single, race-free call (no pagination surface).
         """
-        listing = await client.call("chat.list", {"projectId": project_id})
-        items = listing.get("items", [])
-        if listing.get("hasMore"):
-            # A paged-away successor must never be misread as "no
-            # successor" (the default page is 50; per-trial projects sit
-            # far below it, so this is a tripwire, not a working path).
+        chat = await client.call("chat.get", {"chatId": chat_id})
+        if "continuationChatId" not in chat:
+            # A pre-372 backend omits the key entirely. Reading absence
+            # as "no successor" would silently truncate a compacted run.
             raise RuntimeError(
-                f"chat.list for project {project_id} returned hasMore=true "
-                f"({len(items)} items on the page); a compaction successor "
-                "could be paged away — refusing to guess"
+                f"chat.get for chat {chat_id} returned no continuationChatId "
+                "field; the backend predates task-372 — point "
+                "SLOPON_RUNNER_RUNTIME at a current release"
             )
-        successors = [
-            int(item["id"])
-            for item in items
-            if item.get("previousChatId") == chat_id
-        ]
-        if not successors:
+        raw = chat["continuationChatId"]
+        if raw is None:
             return None
-        if len(successors) > 1:
-            # CompactionService creates exactly one successor and nothing
-            # else in the benchmark flow writes previousChatId; more than
-            # one match is an anomalous backend state — never pick one.
+        successor = int(raw)
+        if successor == chat_id:
+            # Defensive: unreachable while compaction always creates a
+            # new row, but guards against backend contract drift.
             raise RuntimeError(
-                f"chat.list returned {len(successors)} successors of chat "
-                f"{chat_id}: {successors}; expected at most one"
+                f"chat.get returned chat {chat_id} as its own continuation; "
+                "refusing to loop forever"
             )
-        return successors[0]
+        return successor
 
     async def _salvage_after_cancel(
         self, client: SlopOnBackendClient, chat_id: int, chain: list[int]

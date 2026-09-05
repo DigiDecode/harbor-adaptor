@@ -122,8 +122,8 @@ context mid-run and the agent continued in successor chats),
 ## 5. Job / concurrency
 
 ```
-harbor job start -c examples/hello-world-slopon.yaml            # from the harbor repo root
-harbor job start -c examples/hello-world-slopon.yaml --print-config
+harbor job start -c /path/to/harbor-adaptor/examples/hello-world-slopon.yaml            # from the harbor repo root; the task path resolves against CWD
+harbor job start -c /path/to/harbor-adaptor/examples/hello-world-slopon.yaml --print-config
 ```
 
 Start it from a shell with `SLOPON_LLM_API_KEY` exported. The example
@@ -181,7 +181,11 @@ dialed.
   history) until the task completes; each swap adds another chat row.
   `SLOPON_LLM_CONTEXT_SIZE` must be set to the model's full context
   window in tokens — without it the backend's compaction stop condition
-  never fires and trials would silently truncate.
+  never fires and trials would silently truncate. Successor detection
+  uses the backend's `chat.get` → `continuationChatId` field; on a
+  runtime predating it the agent fails the run loudly at the first
+  stream end — refresh `SLOPON_RUNNER_RUNTIME` from `releases/latest`
+  (§2) rather than pinning an old runtime.
 - **Credential rotation** = fresh benchmark instance (fresh `~/.slopon`).
 - **Backend restart mid-trial** orphans in-flight jobs (known backend
   limitation): restart the benchmark job; the DB is disposable.
