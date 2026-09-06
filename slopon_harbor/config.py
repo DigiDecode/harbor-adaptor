@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -32,6 +33,9 @@ DEFAULT_CONTAINER_WORKDIR = "/app"
 DEFAULT_LLM_TYPE = "openai_compatible"
 DEFAULT_RUNNER_ONLINE_TIMEOUT_SEC = 90.0
 DEFAULT_NODE_VERSION = "22.17.1"
+
+# Mirrors the backend api-provider schema's reasoningEffortValues enum.
+REASONING_EFFORT_VALUES = ("none", "minimal", "low", "medium", "high", "xhigh")
 
 AGENT_ENV_FORBIDDEN = (
     "SLOPON_BACKEND_API_KEY",
@@ -127,6 +131,9 @@ class AdaptorConfig:
     llm_api_key: str
     llm_model_id: str
     llm_context_size: int
+    llm_supports_image: bool | None
+    llm_temperature: float | None
+    llm_reasoning_effort: str | None
     runner_online_timeout_sec: float
     node_version: str
 
@@ -235,6 +242,46 @@ class AdaptorConfig:
                 f"got {context_raw!r}"
             )
 
+        # ── optional LLM settings (None = unset) ─────────────────────────
+        supports_raw = resolve("SLOPON_LLM_SUPPORTS_IMAGE")
+        if supports_raw:
+            if supports_raw not in ("true", "false"):
+                raise AdaptorConfigError(
+                    "SLOPON_LLM_SUPPORTS_IMAGE must be 'true' or 'false', "
+                    f"got {supports_raw!r}"
+                )
+            llm_supports_image = supports_raw == "true"
+        else:
+            llm_supports_image = None
+
+        temperature_raw = resolve("SLOPON_LLM_TEMPERATURE")
+        if temperature_raw:
+            try:
+                llm_temperature = float(temperature_raw)
+            except ValueError as err:
+                raise AdaptorConfigError(
+                    f"SLOPON_LLM_TEMPERATURE must be a finite number, "
+                    f"got {temperature_raw!r}"
+                ) from err
+            if not math.isfinite(llm_temperature):
+                raise AdaptorConfigError(
+                    f"SLOPON_LLM_TEMPERATURE must be finite, "
+                    f"got {temperature_raw!r}"
+                )
+        else:
+            llm_temperature = None
+
+        effort_raw = resolve("SLOPON_LLM_REASONING_EFFORT")
+        if effort_raw:
+            if effort_raw not in REASONING_EFFORT_VALUES:
+                raise AdaptorConfigError(
+                    "SLOPON_LLM_REASONING_EFFORT must be one of "
+                    f"{'|'.join(REASONING_EFFORT_VALUES)}, got {effort_raw!r}"
+                )
+            llm_reasoning_effort = effort_raw
+        else:
+            llm_reasoning_effort = None
+
         runtime_raw = resolve("SLOPON_RUNNER_RUNTIME")
         if not runtime_raw:
             raise AdaptorConfigError(
@@ -282,6 +329,9 @@ class AdaptorConfig:
             llm_api_key=llm_api_key,
             llm_model_id=llm_model_id,
             llm_context_size=llm_context_size,
+            llm_supports_image=llm_supports_image,
+            llm_temperature=llm_temperature,
+            llm_reasoning_effort=llm_reasoning_effort,
             runner_online_timeout_sec=online_timeout,
             node_version=node_version,
         )

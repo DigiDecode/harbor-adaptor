@@ -6,9 +6,11 @@ authenticated client connection:
 1. ``ensure_provider`` — reuse the benchmark provider row by name, create
    it on first use (never sending ``reasoningEffort`` — the service
    defaults it to ``'high'`` and an explicit ``null`` breaks
-   ``openai_compatible`` providers), then assert the provider
-   ``contextSize`` compaction gate via ``apiProvider.update`` (rows
-   created before compaction was enabled lack it).
+   ``openai_compatible`` providers), then assert via ``apiProvider.update``
+   the provider ``contextSize`` compaction gate (rows created before
+   compaction was enabled lack it) plus any configured optional LLM
+   settings (``supportsImage`` / ``temperature`` / ``reasoningEffort``;
+   unset env means the key is omitted so the stored row value survives).
 2. ``ensure_compaction_enabled`` — global ``config.set`` asserting
    ``global.context-compaction.enabled = 'true'`` on every setup
    (self-heals ``'false'`` rows written by older adaptor versions;
@@ -153,13 +155,21 @@ class TrialProvisioner:
         # reused rows created before this adaptor version lack it — assert
         # the compaction gate on every setup. Idempotent: fires once per
         # ensure_provider() call site (twice per trial by design).
-        await self._client.call(
-            "apiProvider.update",
-            {
-                "id": self._provider_id,
-                "contextSize": self._config.llm_context_size,
-            },
-        )
+        # contextSize stays unconditional; the optional settings are sent
+        # only when configured — an absent key lets the backend preserve
+        # the stored row value, while an explicit null would overwrite it
+        # (and null reasoningEffort breaks openai_compatible providers).
+        payload: dict = {
+            "id": self._provider_id,
+            "contextSize": self._config.llm_context_size,
+        }
+        if self._config.llm_supports_image is not None:
+            payload["supportsImage"] = self._config.llm_supports_image
+        if self._config.llm_temperature is not None:
+            payload["temperature"] = self._config.llm_temperature
+        if self._config.llm_reasoning_effort is not None:
+            payload["reasoningEffort"] = self._config.llm_reasoning_effort
+        await self._client.call("apiProvider.update", payload)
         return self._provider_id
 
     async def _find_or_create_provider(self) -> int:

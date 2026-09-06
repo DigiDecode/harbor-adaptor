@@ -3,7 +3,8 @@
 Lifecycle:
 
 - ``setup()`` provisions the backend side (provider with a ``contextSize``
-  compaction-gate assertion, compaction enable-assert, runner row), then
+  compaction-gate assertion plus any configured optional LLM settings,
+  compaction enable-assert, runner row), then
   the in-container side (Node, runtime tarball upload + unpack, gateway
   discovery, runner start), waits for the runner to come online and
   finishes backend provisioning (project, source folder, bot, approval

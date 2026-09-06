@@ -176,9 +176,13 @@ dialed.
 - **Context compaction is always-on**: every setup asserts
   `global.context-compaction.enabled = 'true'` (self-healing `'false'`
   rows written by older adaptors) and the provider `contextSize` via
-  `apiProvider.update`. When the backend compacts a chat mid-run, the
-  agent continues streaming the successor chat (resumed from persisted
-  history) until the task completes; each swap adds another chat row.
+  `apiProvider.update` — the same update also carries
+  `SLOPON_LLM_SUPPORTS_IMAGE` / `SLOPON_LLM_TEMPERATURE` /
+  `SLOPON_LLM_REASONING_EFFORT` when those are set (unset = the key is
+  omitted and the stored provider value survives). When the backend
+  compacts a chat mid-run, the agent continues streaming the successor
+  chat (resumed from persisted history) until the task completes; each
+  swap adds another chat row.
   `SLOPON_LLM_CONTEXT_SIZE` must be set to the model's full context
   window in tokens — without it the backend's compaction stop condition
   never fires and trials would silently truncate. Successor detection
@@ -191,7 +195,22 @@ dialed.
   limitation): restart the benchmark job; the DB is disposable.
 - **Never set provider `reasoningEffort` to `null`** (breaks
   `openai_compatible` providers; the adaptor never sends the field on
-  create — the service defaults it to `'high'`).
+  create — the service defaults it to `'high'`). The adaptor also never
+  sends `null` on update: an unset `SLOPON_LLM_REASONING_EFFORT` omits
+  the key entirely. An operator-set value is sent verbatim — and `'none'`
+  is rejected by some OpenAI-compatible backends, so only set it when the
+  target backend accepts it.
+- **Backend version skew = silent no-op**: backends older than the
+  optional-settings feature silently ignore the new `apiProvider.update`
+  keys (their update whitelist drops unknown fields), so
+  `SLOPON_LLM_SUPPORTS_IMAGE` / `SLOPON_LLM_TEMPERATURE` /
+  `SLOPON_LLM_REASONING_EFFORT` become no-ops rather than errors — run a
+  current backend release if you rely on them.
+- **Shared provider row is last-writer-wins**: all trials of an
+  `llm_type` reuse the single `benchmark-<llm_type>` provider row, so
+  concurrently running harbor jobs with differing `SLOPON_LLM_*`
+  settings (including `SLOPON_LLM_CONTEXT_SIZE`) overwrite each other's
+  values — keep the settings uniform across concurrently running jobs.
 - **The in-container runner needs a writable home directory**
   (`~/.slopon/<instanceId>/` is derived at startup). Works as root
   (hello-world's default agent user); tasks with a non-root agent user
@@ -216,6 +235,9 @@ dialed.
 | `SLOPON_LLM_API_KEY` | **yes** | **process env only** | LLM provider key. |
 | `SLOPON_LLM_MODEL_ID` | **yes*** | agent env / process env | Falls back to harbor `-m/--model`. |
 | `SLOPON_LLM_CONTEXT_SIZE` | **yes** | agent env / process env | Model context window in tokens (full window, not output cap); drives the backend compaction threshold (compaction is always-on; a missing/invalid value fails fast at config load). |
+| `SLOPON_LLM_SUPPORTS_IMAGE` | no | agent env / process env | `true`/`false` (case-sensitive). Unset = leave the provider row unchanged. |
+| `SLOPON_LLM_TEMPERATURE` | no | agent env / process env | Any finite number. Unset = leave the provider row unchanged. |
+| `SLOPON_LLM_REASONING_EFFORT` | no | agent env / process env | `none|minimal|low|medium|high|xhigh`. Unset = leave the provider row unchanged. |
 | `SLOPON_RUNNER_ONLINE_TIMEOUT_SEC` | no | agent env / process env | Default `90`. |
 | `SLOPON_NODE_VERSION` | no | agent env / process env | Pinned Node; default `22.17.1`, major must be 22. |
 

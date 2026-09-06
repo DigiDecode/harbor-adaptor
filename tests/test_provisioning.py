@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 import pytest
 
@@ -141,6 +141,9 @@ def config() -> AdaptorConfig:
         llm_api_key="llm-key",
         llm_model_id="model-x",
         llm_context_size=128000,
+        llm_supports_image=None,
+        llm_temperature=None,
+        llm_reasoning_effort=None,
         runner_online_timeout_sec=0.3,
         node_version="v22.17.1",
     )
@@ -172,8 +175,11 @@ class TestProvider:
         assert created["name"] == "benchmark-openai_compatible"
         assert created["baseUrl"] == "https://llm.example.com/v1"
         assert created["modelId"] == "model-x"
-        # reasoningEffort must never be sent (backend defaults it).
+        # reasoningEffort must never be sent (backend defaults it); the
+        # optional settings ride apiProvider.update instead of create.
         assert "reasoningEffort" not in created
+        assert "supportsImage" not in created
+        assert "temperature" not in created
 
     async def test_provider_create_race_recovers(self, config):
         client = FakeClient()
@@ -214,6 +220,47 @@ class TestProvider:
         provider_id = client.providers[0]["id"]
         for update in updates:
             assert update == {"id": provider_id, "contextSize": 128000}
+
+
+class TestOptionalProviderSettings:
+    async def test_all_settings_set_update_payload_exact(self, config):
+        client = FakeClient()
+        tuned = replace(
+            config,
+            llm_supports_image=True,
+            llm_temperature=0.7,
+            llm_reasoning_effort="high",
+        )
+        resources = await full_flow(client, tuned)
+        await full_flow(client, tuned)
+        expected = {
+            "id": resources.provider_id,
+            "contextSize": 128000,
+            "supportsImage": True,
+            "temperature": 0.7,
+            "reasoningEffort": "high",
+        }
+        updates = client.methods("apiProvider.update")
+        # Every update across both flows (two call sites per flow) —
+        # reuse path included — carries the exact same payload.
+        assert updates
+        assert all(update == expected for update in updates)
+
+    async def test_partial_settings_omit_unset_keys(self, config):
+        client = FakeClient()
+        partial = replace(config, llm_reasoning_effort="low")
+        resources = await full_flow(client, partial)
+        updates = client.methods("apiProvider.update")
+        assert updates
+        for update in updates:
+            # Key absence, never explicit null: the stored row value survives.
+            assert "supportsImage" not in update
+            assert "temperature" not in update
+            assert update == {
+                "id": resources.provider_id,
+                "contextSize": 128000,
+                "reasoningEffort": "low",
+            }
 
 
 class TestRunnerAndProject:
